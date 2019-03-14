@@ -286,7 +286,7 @@ compileKernelExp _ _ (GroupGenReduce w arrs op bucket values locks) = do
   sWhen (indexInBounds bucket' w') $ do
     forM_ (zip values_params values) $ \(p, v) ->
       ImpGen.copyDWIM (paramName p) [] v []
-    atomicUpdate arrs bucket' op locking
+    atomicUpdate DefaultSpace arrs bucket' op locking
   where indexInBounds inds bounds =
           foldl1 (.&&.) $ zipWith checkBound inds bounds
           where checkBound ind bound = 0 .<=. ind .&&. ind .<. bound
@@ -324,20 +324,20 @@ type AtomicUpdate lore =
   [VName] -> [Imp.Exp] -> ImpGen.ImpM lore Imp.KernelOp ()
 
 atomicUpdate :: ExplicitMemorish lore =>
-                [VName] -> [Imp.Exp] -> Lambda lore -> Locking
+                Space -> [VName] -> [Imp.Exp] -> Lambda lore -> Locking
              -> ImpGen.ImpM lore Imp.KernelOp ()
-atomicUpdate arrs bucket lam locking =
-  case atomicUpdateLocking lam of
+atomicUpdate space arrs bucket lam locking =
+  case atomicUpdateLocking space lam of
     Left f -> f arrs bucket
     Right f -> f locking arrs bucket
 
 -- | 'atomicUpdate', but where it is explicitly visible whether a
 -- locking strategy is necessary.
 atomicUpdateLocking :: ExplicitMemorish lore =>
-                       Lambda lore
+                       Space -> Lambda lore
                     -> Either (AtomicUpdate lore) (Locking -> AtomicUpdate lore)
 
-atomicUpdateLocking lam
+atomicUpdateLocking space lam
   | Just ops_and_ts <- splitOp lam,
     all (\(_, t, _) -> primBitSize t == 32) ops_and_ts = Left $ \arrs bucket ->
   -- If the operator is a vectorised binary operator on 32-bit values,
@@ -383,7 +383,7 @@ atomicUpdateLocking lam
         y <-- Imp.var assumed t
         x <-- Imp.BinOpExp op (Imp.var x t) (Imp.var y t)
         old_bits <- dPrim "old_bits" int32
-        sOp $ Imp.Atomic $
+        sOp $ Imp.Atomic space $
           Imp.AtomicCmpXchg old_bits arr' bucket_offset
           (toBits (Imp.var assumed t)) (toBits (Imp.var x t))
         old <-- fromBits (Imp.var old_bits int32)
@@ -391,10 +391,10 @@ atomicUpdateLocking lam
           (run_loop <-- 0)
 
   where opHasAtomicSupport old arr' bucket' bop = do
-          let atomic f = Imp.Atomic . f old arr' bucket'
+          let atomic f = Imp.Atomic space . f old arr' bucket'
           atomic <$> Imp.atomicBinOp bop
 
-atomicUpdateLocking op = Right $ \locking arrs bucket -> do
+atomicUpdateLocking space op = Right $ \locking arrs bucket -> do
   old <- dPrim "old" int32
   continue <- dPrimV "continue" true
 
@@ -404,13 +404,13 @@ atomicUpdateLocking op = Right $ \locking arrs bucket -> do
 
   -- Critical section
   let try_acquire_lock =
-        sOp $ Imp.Atomic $
+        sOp $ Imp.Atomic space $
         Imp.AtomicCmpXchg old locks' locks_offset (lockingIsUnlocked locking) (lockingToLock locking)
       lock_acquired = Imp.var old int32 .==. lockingIsUnlocked locking
       -- Even the releasing is done with an atomic rather than a
       -- simple write, for memory coherency reasons.
       release_lock =
-        sOp $ Imp.Atomic $
+        sOp $ Imp.Atomic space $
         Imp.AtomicCmpXchg old locks' locks_offset (lockingToLock locking) (lockingToUnlock locking)
       break_loop = continue <-- false
 
