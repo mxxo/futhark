@@ -306,7 +306,7 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
       --
       -- num_histos := num_histos_per_group * number of groups
 
-      let local_mem_per_group = ImpGen.compilePrimExp (32 * 1024) -- XXX: Query the device.
+      let local_mem_per_group = ImpGen.compilePrimExp (16 * 1024) -- XXX: Query the device.
           elem_size = Imp.LeafExp (Imp.SizeOf int32) int32 -- XXX: Use dest_t.
           hist_size = ImpGen.compileSubExpOfType int32 $ genReduceWidth op
           coop_lvl = BinOpExp (SMax Int32) 1
@@ -341,7 +341,7 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
         (sub_mem, size') <-
           ImpGen.sDeclareMem "subhistogram_mem" size $ Space "device"
 
-        let sub_local_shape = Shape [intConst Int32 (32 * 256)] -- XXX
+        let sub_local_shape = Shape [intConst Int32 (16 * 256)] -- XXX
         subhistogram_local <- ImpGen.sAllocArray "subhistogram_local" (elemType dest_t) sub_local_shape $ Space "local"
 
         let num_segments = length segment_dims
