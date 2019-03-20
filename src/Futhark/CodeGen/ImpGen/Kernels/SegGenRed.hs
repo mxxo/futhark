@@ -318,6 +318,7 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
       coop_lvl' <- dPrimV "coop_lvl" coop_lvl
       group_hists_size' <- dPrimV "group_hists_size" group_hists_size
       num_hists' <- dPrimV "num_hists" num_hists
+      num_hists_inc1 <- dPrimV "num_hists_inc1" $ Imp.var num_hists' int32 + 1
 
       forM_ [ ("Element size", elem_size)
             , ("Histogram size", hist_size)
@@ -331,7 +332,7 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
       -- Initialise sub-histograms.
       dests <- forM (zip (genReduceDest op) (genReduceNeutral op)) $ \(dest, ne) -> do
         dest_t <- lookupType dest
-        let num_elems = foldl' (*) (Imp.var num_hists' int32) $
+        let num_elems = foldl' (*) (Imp.var num_hists_inc1 int32) $
                         map (ImpGen.compileSubExpOfType int32) $
                         arrayDims dest_t
         let size = Imp.elements num_elems `Imp.withElemType` int32
@@ -343,7 +344,7 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
         subhistogram_local <- ImpGen.sAllocArray "subhistogram_local" (elemType dest_t) sub_local_shape $ Space "local"
 
         let num_segments = length segment_dims
-            sub_shape = Shape (segment_dims++[Var num_hists']) <>
+            sub_shape = Shape (segment_dims++[Var num_hists_inc1]) <>
                         stripDims num_segments (arrayShape dest_t)
             sub_membind = ArrayIn sub_mem $ IxFun.iota $
                           map (primExpFromSubExp int32) $ shapeDims sub_shape
@@ -352,9 +353,16 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
         ImpGen.sAlloc_ sub_mem size' $ Space "device"
         sReplicate subhisto (Shape $ segment_dims ++ [Var num_hists', genReduceWidth op]) ne
         subhisto_t <- lookupType subhisto
+        -- Allocate one more global subhistogram than needed for the in-kernel
+        -- transfer from local to global memory, and then put the histogram
+        -- memory inside just that one.  This subhistogram is then also used in
+        -- the final reduction phase.  This approach ensures that the original
+        -- contents of the input histogram are not ignored, but is also a bit
+        -- more wasteful than the global-memory-only approach.  This seems the
+        -- simplest way to do it.
         let slice = fullSliceNum (map (ImpGen.compileSubExpOfType int32) $ arrayDims subhisto_t) $
                     map (unitSlice 0 . ImpGen.compileSubExpOfType int32) segment_dims ++
-                    [DimFix 0]
+                    [DimFix (Imp.var num_hists' int32)]
         ImpGen.sUpdate subhisto slice $ Var dest
 
         return (subhisto, subhistogram_local)
@@ -375,8 +383,9 @@ genRedKernelLocal map_pes space ops body = do
       i32_to_i64 = ConvOpExp (SExt Int32 Int64)
       space_sizes_64 = map (i32_to_i64 . ImpGen.compileSubExpOfType int32) space_sizes
       total_w_64 = product space_sizes_64
+      segment_dims = init space_sizes
 
-  histograms <- prepareIntermediateArraysLocal (init space_sizes) (kernelNumThreads constants) ops
+  histograms <- prepareIntermediateArraysLocal segment_dims (kernelNumThreads constants) ops
 
   elems_per_thread_64 <- dPrimV "elems_per_thread_64" $
                          total_w_64 `quotRoundingUp`
@@ -500,46 +509,37 @@ compileSegGenRedLocal (Pattern _ pes) genred_space ops body = do
   let pes_per_op = chunks (map (length . genReduceDest) ops) all_red_pes
 
   forM_ (zip3 infos pes_per_op ops) $ \((num_histos, subhistos), red_pes, op) -> do
-    let unitHistoCase =
-          -- This is OK because the memory blocks are at least as
-          -- large as the ones we are supposed to use for the result.
-          forM_ (zip red_pes subhistos) $ \(pe, subhisto) -> do
-            pe_mem <- ImpGen.memLocationName . ImpGen.entryArrayLocation <$>
-                      ImpGen.lookupArray (patElemName pe)
-            subhisto_mem <- ImpGen.memLocationName . ImpGen.entryArrayLocation <$>
-                            ImpGen.lookupArray subhisto
-            ImpGen.emit $ Imp.SetMem pe_mem subhisto_mem $ Space "device"
+    -- For the segmented reduction, we keep the segment dimensions
+    -- unchanged.  To this, we add two dimensions: one over the number
+    -- of buckets, and one over the number of subhistograms.  This
+    -- inner dimension is the one that is collapsed in the reduction.
+    let segment_dims = init $ spaceDimensions genred_space
+        num_buckets = genReduceWidth op
 
-    sIf (Imp.var num_histos int32 .==. 1) unitHistoCase $ do
-      -- For the segmented reduction, we keep the segment dimensions
-      -- unchanged.  To this, we add two dimensions: one over the number
-      -- of buckets, and one over the number of subhistograms.  This
-      -- inner dimension is the one that is collapsed in the reduction.
-      let segment_dims = init $ spaceDimensions genred_space
-          num_buckets = genReduceWidth op
+    num_hists_inc1 <- dPrimV "num_hists_inc1" $ Imp.var num_histos int32 + 1
 
-      bucket_id <- newVName "bucket_id"
-      subhistogram_id <- newVName "subhistogram_id"
-      vector_ids <- mapM (const $ newVName "vector_id") $
-                    shapeDims $ genReduceShape op
-      gtid <- newVName $ baseString $ spaceGlobalId genred_space
-      let lam = genReduceOp op
-          segred_space =
-            genred_space
-            { spaceStructure =
-                FlatThreadSpace $
-                segment_dims ++
-                [(bucket_id, num_buckets)] ++
-                zip vector_ids (shapeDims $ genReduceShape op) ++
-                [(subhistogram_id, Var num_histos)]
-            , spaceGlobalId = gtid
-            }
+    bucket_id <- newVName "bucket_id"
+    subhistogram_id <- newVName "subhistogram_id"
+    vector_ids <- mapM (const $ newVName "vector_id") $
+                  shapeDims $ genReduceShape op
+    gtid <- newVName $ baseString $ spaceGlobalId genred_space
+    let lam = genReduceOp op
+        segred_space =
+          genred_space
+          { spaceStructure =
+              FlatThreadSpace $
+              segment_dims ++
+              [(bucket_id, num_buckets)] ++
+              zip vector_ids (shapeDims $ genReduceShape op) ++
+              [(subhistogram_id, Var num_hists_inc1)]
+          , spaceGlobalId = gtid
+          }
 
-      compileSegRed' (Pattern [] red_pes) segred_space
-        Commutative lam (genReduceNeutral op) $ \red_dests _ ->
-        forM_ (zip red_dests subhistos) $ \((d, is), subhisto) ->
-          ImpGen.copyDWIM d is (Var subhisto) $ map (`Imp.var` int32) $
-          map fst segment_dims ++ [subhistogram_id, bucket_id] ++ vector_ids
+    compileSegRed' (Pattern [] red_pes) segred_space
+      Commutative lam (genReduceNeutral op) $ \red_dests _ ->
+      forM_ (zip red_dests subhistos) $ \((d, is), subhisto) ->
+        ImpGen.copyDWIM d is (Var subhisto) $ map (`Imp.var` int32) $
+        map fst segment_dims ++ [subhistogram_id, bucket_id] ++ vector_ids
 
 -- | Can we reliably use the kernel that computes subhistograms in local memory?
 -- This can be determined at runtime.
