@@ -430,8 +430,8 @@ returnAliased fname name loc =
 uniqueReturnAliased :: MonadTypeChecker m => Name -> SrcLoc -> m a
 uniqueReturnAliased fname loc =
   throwError $ TypeError loc $
-  "A unique tuple element of return value of function " ++
-  nameToString fname ++ " is aliased to some other tuple component."
+  "A unique tuple element of return value of " ++
+  quote (nameToString fname) ++ " is aliased to some other tuple component."
 
 --- Basic checking
 
@@ -1024,44 +1024,6 @@ checkExp (Index e idxes NoInfo loc) = do
   where isFix DimFix{} = True
         isFix _        = False
 
-checkExp (Zip i e es NoInfo loc) = do
-  let checkInput inp = do (arr_t, _) <- newArrayType (srclocOf e) "e" (1+i)
-                          unifies arr_t =<< checkExp inp
-  e' <- checkInput e
-  es' <- mapM checkInput es
-
-  e_ts <- mapM expType $ e':es'
-  ts <- forM (zip (e':es') e_ts) $ \(arr_e, arr_e_t) ->
-    case typeToRecordArrayElem =<< peelArray (i+1) arr_e_t of
-      Just t -> return t
-      Nothing -> typeError (srclocOf arr_e) $
-                 "Expected array with at least " ++ show (1+i) ++
-                 " dimensions, but got " ++ pretty arr_e_t ++ "."
-
-  let u = mconcat $ map (uniqueness . typeOf) $ e':es'
-      t = Array (mconcat $ map aliases e_ts) u
-          (ArrayRecordElem $ M.fromList $ zip tupleFieldNames ts)
-          (rank (1+i))
-  return $ Zip i e' es' (Info t) loc
-
-checkExp (Unzip e _ loc) = do
-  e' <- checkExp e
-  e_t <- expType e'
-  case e_t of
-    Array _ u (ArrayRecordElem fs) shape
-      | Just ets <- map (componentType shape u) <$> areTupleFields fs ->
-          return $ Unzip e' (map Info ets) loc
-    t ->
-      typeError loc $
-      "Argument to unzip is not an array of tuples, but " ++
-      pretty t ++ "."
-  where componentType shape u et =
-          case et of
-            RecordArrayElem et' ->
-              Array mempty u et' shape
-            RecordArrayArrayElem et' et_shape ->
-              Array mempty u et' (shape <> et_shape)
-
 checkExp (Unsafe e loc) =
   Unsafe <$> checkExp e <*> pure loc
 
@@ -1256,20 +1218,26 @@ checkExp (DoLoop tparams mergepat mergeexp form loopbody loc) =
       let checkMergeReturn (Id pat_v (Info pat_v_t) _) t
             | unique pat_v_t,
               v:_ <- S.toList $ S.map aliasVar (aliases t) `S.intersection` bound_outside =
-                lift $ typeError loc $ "Loop return value corresponding to merge parameter " ++
-                prettyName pat_v ++ " aliases " ++ prettyName v ++ "."
+                lift $ typeError loc $ "Loop return value corresponding to merge parameter `" ++
+                quote (prettyName pat_v) ++ "` aliases " ++ prettyName v ++ "."
             | otherwise = do
                 (cons,obs) <- get
                 unless (S.null $ aliases t `S.intersection` cons) $
                   lift $ typeError loc $ "Loop return value for merge parameter " ++
-                  prettyName pat_v ++ " aliases other consumed merge parameter."
+                  quote (prettyName pat_v) ++ " aliases other consumed merge parameter."
                 when (unique pat_v_t &&
                       not (S.null (aliases t `S.intersection` (cons<>obs)))) $
                   lift $ typeError loc $ "Loop return value for consuming merge parameter " ++
-                  prettyName pat_v ++ " aliases previously returned value." ++ show (aliases t, cons, obs)
+                  quote (prettyName pat_v) ++ " aliases previously returned value."
                 if unique pat_v_t
                   then put (cons<>aliases t, obs)
                   else put (cons, obs<>aliases t)
+          checkMergeReturn (PatternParens p _) t =
+            checkMergeReturn p t
+          checkMergeReturn (PatternAscription p _ _) t =
+            checkMergeReturn p t
+          checkMergeReturn (RecordPattern pfs _) (Record tfs) =
+            sequence_ $ M.elems $ M.intersectionWith checkMergeReturn (M.fromList pfs) tfs
           checkMergeReturn (TuplePattern pats _) t | Just ts <- isTupleRecord t =
             zipWithM_ checkMergeReturn pats ts
           checkMergeReturn _ _ =
