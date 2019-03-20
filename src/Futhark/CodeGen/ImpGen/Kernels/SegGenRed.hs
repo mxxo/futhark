@@ -398,6 +398,25 @@ genRedKernelLocal map_pes space ops body = do
       dPrimV "subhisto_global_ind" $
       kernelGroupId constants * Imp.var group_hists_size int32
 
+    let (red_res, map_res) = splitFromEnd (length map_pes) $ bodyResult body
+        (buckets, vs) = splitAt (length ops) red_res
+        perOp = chunks $ map (length . genReduceDest) ops
+
+    -- XXX: support more than one dest with local memory?  quickly becomes inefficient
+    forM_ (zip ops histograms) $
+      \(GenReduceOp _ _ nes _ _,
+        (_, dests, _, (_, group_hists_size))) ->
+        sComment "initialize histograms in local memory" $
+          forM_ (zip dests nes) $ \((_dest_global, dest_local), ne) -> do
+          ne' <- ImpGen.compileSubExp ne
+          i' <- newVName "i"
+          sFor i' Int32 (Imp.var group_hists_size int32
+                         `quot` kernelGroupSize constants) $ do
+            let j' = Imp.var i' int32 * kernelGroupSize constants + kernelLocalThreadId constants
+            ImpGen.sWrite dest_local [j'] ne'
+
+    ImpGen.sOp Imp.LocalBarrier
+
     sFor i Int64 (Imp.var elems_per_thread_64 int64) $ do
       -- Compute the offset into the input and output.  To this a
       -- thread can add its local ID to figure out which element it is
@@ -425,20 +444,16 @@ genRedKernelLocal map_pes space ops body = do
       let input_in_bounds = Imp.var j int32 .<. total_w_64
 
       sWhen input_in_bounds $ ImpGen.compileStms mempty (stmsToList $ bodyStms body) $ do
-        let (red_res, map_res) = splitFromEnd (length map_pes) $ bodyResult body
 
         sComment "save map-out results" $
           forM_ (zip map_pes map_res) $ \(pe, se) ->
           ImpGen.copyDWIM (patElemName pe)
           (map ((`Imp.var` int32) . fst) $ kernelDimensions constants) se []
 
-        let (buckets, vs) = splitAt (length ops) red_res
-            perOp = chunks $ map (length . genReduceDest) ops
-
-        forM_ (zip6 ops histograms buckets (perOp vs) subhisto_local_inds subhisto_global_inds) $
-          \(GenReduceOp dest_w _ nes shape lam,
-            (_, dests, do_op, (_, group_hists_size)), bucket, vs',
-            subhisto_local_ind, subhisto_global_ind) -> do
+        forM_ (zip5 ops histograms buckets (perOp vs) subhisto_local_inds) $
+          \(GenReduceOp dest_w _ _ shape lam,
+            (_, _, do_op, _), bucket, vs',
+            subhisto_local_ind) -> do
 
             let bucket' = ImpGen.compileSubExpOfType int32 bucket
                 dest_w' = ImpGen.compileSubExpOfType int32 dest_w
@@ -446,18 +461,6 @@ genRedKernelLocal map_pes space ops body = do
                 bucket_is = map (`Imp.var` int32) (init space_is) ++
                             [Imp.var subhisto_local_ind int32 + bucket', bucket']
                 vs_params = takeLast (length vs') $ lambdaParams lam
-
-            -- XXX: support more than one dest with local memory?  quickly becomes inefficient
-            sComment "initialize histograms in local memory" $
-              forM_ (zip dests nes) $ \((_dest_global, dest_local), ne) -> do
-              ne' <- ImpGen.compileSubExp ne
-              i' <- newVName "i"
-              sFor i' Int32 (Imp.var group_hists_size int32
-                             `quot` kernelGroupSize constants) $ do
-                let j' = Imp.var i' int32 * kernelGroupSize constants + kernelLocalThreadId constants
-                ImpGen.sWrite dest_local [j'] ne'
-
-            ImpGen.sOp Imp.LocalBarrier
 
             sComment "perform atomic updates" $
               sWhen bucket_in_bounds $ do
@@ -467,17 +470,19 @@ genRedKernelLocal map_pes space ops body = do
                   ImpGen.copyDWIM (paramName p) [] v is
                 trace ("do_op " ++ show bucket_is ++ " " ++ show is) $ do_op (bucket_is ++ is)
 
-            ImpGen.sOp Imp.LocalBarrier
+    ImpGen.sOp Imp.LocalBarrier
 
-            sComment "copy local histogram to global memory" $
-              forM_ dests $ \(dest_global, dest_local) -> do
-              i' <- newVName "i"
-              sFor i' Int32 (Imp.var group_hists_size int32
-                             `quot` kernelGroupSize constants) $ do
-                let j' = Imp.var i' int32 * kernelGroupSize constants + kernelLocalThreadId constants
-                    global_j = Imp.var subhisto_global_ind int32 + j'
-
-                ImpGen.copyDWIM dest_global [0, global_j] (Var dest_local) [j']
+    forM_ (zip4 histograms buckets (perOp vs) subhisto_global_inds) $
+      \((_, dests, _, (_, group_hists_size)), _, _,
+        subhisto_global_ind) ->
+        sComment "copy local histogram to global memory" $
+          forM_ dests $ \(dest_global, dest_local) -> do
+          i' <- newVName "i"
+          sFor i' Int32 (Imp.var group_hists_size int32
+                         `quot` kernelGroupSize constants) $ do
+            let j' = Imp.var i' int32 * kernelGroupSize constants + kernelLocalThreadId constants
+                global_j = Imp.var subhisto_global_ind int32 + j'
+            ImpGen.copyDWIM dest_global [0, global_j] (Var dest_local) [j']
 
   let histogramInfo (num_histos, dests, _, _) = (num_histos, map fst dests)
   return $ map histogramInfo histograms
