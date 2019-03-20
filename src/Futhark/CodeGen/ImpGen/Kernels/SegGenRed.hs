@@ -309,8 +309,9 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
       let local_mem_per_group = ImpGen.compilePrimExp (32 * 1024) -- XXX: Query the device.
           elem_size = Imp.LeafExp (Imp.SizeOf int32) int32 -- XXX: Use dest_t.
           hist_size = ImpGen.compileSubExpOfType int32 $ genReduceWidth op
-          coop_lvl = hist_size `quotRoundingUp` (local_mem_per_group `quot` elem_size `quot` num_threads)
-          num_hists_per_group = BinOpExp (SMin Int32) (local_mem_per_group `quot` hist_size)
+          coop_lvl = BinOpExp (SMax Int32) 1
+                     (hist_size `quotRoundingUp` (local_mem_per_group `quot` elem_size `quot` num_threads))
+          num_hists_per_group = BinOpExp (SMin Int32) (local_mem_per_group `quot` (BinOpExp (SMax Int32) 1 hist_size))
                                 (num_threads `quot` coop_lvl)
           group_hists_size = num_hists_per_group * hist_size
           num_hists = num_hists_per_group * 256 -- XXX: num_groups
