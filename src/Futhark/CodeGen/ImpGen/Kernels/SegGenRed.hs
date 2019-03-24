@@ -311,7 +311,7 @@ prepareIntermediateArraysLocal space segment_dims num_threads num_groups = fmap 
           hist_size = ImpGen.compileSubExpOfType int32 $ genReduceWidth op
           coop_lvl = BinOpExp (SMax Int32) 1 -- XXX: pow2
                      (hist_size `quotRoundingUp`
-                      (BinOpExp (SMax Int32) 1 (local_mem_per_group `quot` elem_size `quot` num_threads)))
+                      (BinOpExp (SMax Int32) 1 (local_mem_per_group `quot` elem_size `quot` ImpGen.compileSubExpOfType int32 (spaceGroupSize space))))
           num_hists_per_group = BinOpExp (SMin Int32)
                                 (local_mem_per_group `quot` (BinOpExp (SMax Int32) 1 hist_size))
                                 (ImpGen.compileSubExpOfType int32 (spaceGroupSize space) `quot` coop_lvl)
