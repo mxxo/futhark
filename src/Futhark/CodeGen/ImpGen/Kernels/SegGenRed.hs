@@ -277,13 +277,13 @@ compileSegGenRedGlobal (Pattern _ pes) genred_space ops body = do
           map fst segment_dims ++ [subhistogram_id, bucket_id] ++ vector_ids
 
 -- XXX: Reuse code.
-prepareIntermediateArraysLocal :: [SubExp] -> Imp.Exp -> [GenReduceOp InKernel]
+prepareIntermediateArraysLocal :: KernelSpace -> [SubExp] -> Imp.Exp -> Imp.Exp -> [GenReduceOp InKernel]
                                -> CallKernelGen
                                   [(VName,
                                     [(VName, VName)],
                                     [Imp.Exp] -> ImpGen.ImpM InKernel Imp.KernelOp (),
                                     (VName, VName))]
-prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM onOp Nothing
+prepareIntermediateArraysLocal space segment_dims num_threads num_groups = fmap snd . mapAccumLM onOp Nothing
   where
     onOp l op = do
       -- Determining the degree of cooperation (heuristic):
@@ -309,19 +309,22 @@ prepareIntermediateArraysLocal segment_dims num_threads = fmap snd . mapAccumLM 
       let local_mem_per_group = ImpGen.compilePrimExp (16 * 1024) -- XXX: Query the device.
           elem_size = Imp.LeafExp (Imp.SizeOf int32) int32 -- XXX: Use dest_t.
           hist_size = ImpGen.compileSubExpOfType int32 $ genReduceWidth op
-          coop_lvl = BinOpExp (SMax Int32) 1
-                     (hist_size `quotRoundingUp` (local_mem_per_group `quot` elem_size `quot` num_threads))
-          num_hists_per_group = BinOpExp (SMin Int32) (local_mem_per_group `quot` (BinOpExp (SMax Int32) 1 hist_size))
-                                (num_threads `quot` coop_lvl)
+          coop_lvl = BinOpExp (SMax Int32) 1 -- XXX: pow2
+                     (hist_size `quotRoundingUp`
+                      (BinOpExp (SMax Int32) 1 (local_mem_per_group `quot` elem_size `quot` num_threads)))
+          num_hists_per_group = BinOpExp (SMin Int32)
+                                (local_mem_per_group `quot` (BinOpExp (SMax Int32) 1 hist_size))
+                                (ImpGen.compileSubExpOfType int32 (spaceGroupSize space) `quot` coop_lvl)
           group_hists_size = num_hists_per_group * hist_size
-          num_hists = num_hists_per_group * 256 -- XXX: num_groups
+          num_hists = num_hists_per_group * num_groups
 
       coop_lvl' <- dPrimV "coop_lvl" coop_lvl
       group_hists_size' <- dPrimV "group_hists_size" group_hists_size
       num_hists' <- dPrimV "num_hists" num_hists
       num_hists_inc1 <- dPrimV "num_hists_inc1" $ Imp.var num_hists' int32 + 1
 
-      forM_ [ ("Element size", elem_size)
+      forM_ [ ("Number of threads", num_threads)
+            , ("Element size", elem_size)
             , ("Histogram size", hist_size)
             , ("Cooperation level", coop_lvl)
             , ("Group hists size", group_hists_size)
@@ -386,11 +389,12 @@ genRedKernelLocal map_pes space ops body = do
       total_w_64 = product space_sizes_64
       segment_dims = init space_sizes
 
-  histograms <- prepareIntermediateArraysLocal segment_dims (kernelNumThreads constants) ops
+  histograms <- prepareIntermediateArraysLocal space segment_dims (kernelNumThreads constants) (kernelNumGroups constants) ops
 
   elems_per_thread_64 <- dPrimV "elems_per_thread_64" $
                          total_w_64 `quotRoundingUp`
                          ConvOpExp (SExt Int32 Int64) (kernelNumThreads constants)
+  ImpGen.emit $ Imp.DebugPrint "Elements per thread" int64 $ Imp.var elems_per_thread_64 int64
 
   sKernel constants "seggenred" $ allThreads constants $ do
     init_constants
