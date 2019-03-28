@@ -478,7 +478,7 @@ inKernelOperations = GenericC.Operations
           GenericC.stm [C.cstm|$id:old = atomic_xchg($esc:(atomicCast s "int")&$id:arr[$exp:ind'], $exp:val');|]
 
         atomicCast s bt = "(" ++ unwords [ "volatile"
-                                         , "__" ++ case space of
+                                         , "__" ++ case s of
                                                      DefaultSpace -> "global"
                                                      Space sid -> sid
                                          , bt
