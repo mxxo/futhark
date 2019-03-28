@@ -424,14 +424,14 @@ badLetWithValue loc =
 returnAliased :: MonadTypeChecker m => Name -> Name -> SrcLoc -> m ()
 returnAliased fname name loc =
   throwError $ TypeError loc $
-  "Unique return value of function " ++ nameToString fname ++
-  " is aliased to " ++ pretty name ++ ", which is not consumed."
+  "Unique return value of function " ++ quote (pretty fname) ++
+  " is aliased to " ++ quote (pretty name) ++ ", which is not consumed."
 
 uniqueReturnAliased :: MonadTypeChecker m => Name -> SrcLoc -> m a
 uniqueReturnAliased fname loc =
   throwError $ TypeError loc $
-  "A unique tuple element of return value of " ++
-  quote (nameToString fname) ++ " is aliased to some other tuple component."
+  "A unique tuple element of return value of `" ++
+  quote (pretty fname) ++ "` is aliased to some other tuple component."
 
 --- Basic checking
 
@@ -959,7 +959,7 @@ checkExp (LetFun name (tparams, params, maybe_retdecl, NoInfo, e) body loc) =
 
     return $ LetFun name' (tparams', params', maybe_retdecl', Info rettype, e') body' loc
 
-checkExp (LetWith dest src idxes ve body pos) = do
+checkExp (LetWith dest src idxes ve body loc) = do
   (t, _) <- newArrayType (srclocOf src) "src" $ length idxes
   let elemt = stripArray (length $ filter isFix idxes) t
   sequentially (checkIdent src) $ \src' _ -> do
@@ -969,18 +969,26 @@ checkExp (LetWith dest src idxes ve body pos) = do
     void $ unifies t src''
 
     unless (unique $ unInfo $ identType src') $
-      typeError pos $ "Source " ++ quote (pretty (identName src)) ++
-      " has type " ++ pretty (unInfo $ identType src') ++ ", which is not unique"
+      typeError loc $ "Source " ++ quote (pretty (identName src)) ++
+      " has type " ++ pretty (unInfo $ identType src') ++ ", which is not unique."
+    vtable <- asks scopeVtable
+    forM_ (aliases $ unInfo $ identType src') $ \v ->
+      case aliasVar v `M.lookup` vtable of
+        Just (BoundV Local _ v_t)
+          | not $ unique v_t ->
+              typeError loc $ "Source " ++ quote (pretty (identName src)) ++
+              " aliases " ++ quote (prettyName (aliasVar v)) ++ ", which is not consumable."
+        _ -> return ()
 
     idxes' <- mapM checkDimIndex idxes
     sequentially (unifies elemt =<< checkExp ve) $ \ve' _ -> do
       ve_t <- expType ve'
       when (AliasBound (identName src') `S.member` aliases ve_t) $
-        badLetWithValue pos
+        badLetWithValue loc
 
       bindingIdent dest (unInfo (identType src') `setAliases` S.empty) $ \dest' -> do
         body' <- consuming src' $ checkExp body
-        return $ LetWith dest' src' idxes' ve' body' pos
+        return $ LetWith dest' src' idxes' ve' body' loc
   where isFix DimFix{} = True
         isFix _        = False
 
@@ -1046,14 +1054,15 @@ checkExp (Lambda tparams params body maybe_retdecl NoInfo loc) =
     maybe_retdecl' <- traverse checkTypeDecl maybe_retdecl
     (body', closure) <- tapOccurences $ noUnique $
                         checkFunBody body (unInfo . expandedType <$> maybe_retdecl') loc
-    (maybe_retdecl'', rettype) <- case maybe_retdecl' of
-      Just retdecl'@(TypeDecl _ (Info st)) -> return (Just retdecl', st)
-      Nothing -> do
-        body_t <- expType body'
-        return (Nothing, inferReturnUniqueness params' body_t)
+    body_t <- expType body'
+    let (maybe_retdecl'', rettype) =
+          case maybe_retdecl' of
+            Just retdecl'@(TypeDecl _ (Info st)) -> (Just retdecl', st)
+            Nothing -> (Nothing, inferReturnUniqueness params' body_t)
+
+    checkGlobalAliases params' body_t loc
 
     closure' <- lexicalClosure params' closure
-
     return $ Lambda tparams' params' body' maybe_retdecl'' (Info (closure', rettype)) loc
 
 checkExp (OpSection op _ loc) = do
@@ -1218,8 +1227,8 @@ checkExp (DoLoop tparams mergepat mergeexp form loopbody loc) =
       let checkMergeReturn (Id pat_v (Info pat_v_t) _) t
             | unique pat_v_t,
               v:_ <- S.toList $ S.map aliasVar (aliases t) `S.intersection` bound_outside =
-                lift $ typeError loc $ "Loop return value corresponding to merge parameter `" ++
-                quote (prettyName pat_v) ++ "` aliases " ++ prettyName v ++ "."
+                lift $ typeError loc $ "Loop return value corresponding to merge parameter " ++
+                quote (prettyName pat_v) ++ " aliases " ++ prettyName v ++ "."
             | otherwise = do
                 (cons,obs) <- get
                 unless (S.null $ aliases t `S.intersection` cons) $
@@ -1620,21 +1629,8 @@ checkFunDef' (fname, maybe_retdecl, tparams, params, body, loc) = noUnique $ do
 
     bindSpaced [(Term, fname)] $ do
       fname' <- checkName Term fname loc
-      vtable <- asks scopeVtable
-      let isLocal v = case v `M.lookup` vtable of
-                        Just (BoundV Local _ _) -> True
-                        _ -> False
-      let als = filter (not . isLocal) $ S.toList $
-                boundArrayAliases body_t `S.difference`
-                S.map identName (mconcat (map patIdentSet params'))
-      case als of
-        v:_ | not $ null params ->
-          typeError loc $
-          unlines [ "Function result aliases the free variable " <>
-                    quote (prettyName v) <> "."
-                  , "Use " ++ quote "copy" ++ " to break the aliasing."]
-        _ ->
-          return (fname', tparams'', params'', maybe_retdecl'', rettype, body')
+      checkGlobalAliases params'' body_t loc
+      return (fname', tparams'', params'', maybe_retdecl'', rettype, body')
 
   where -- | Check that unique return values do not alias a
         -- non-consumed parameter.
@@ -1667,6 +1663,25 @@ checkFunDef' (fname, maybe_retdecl, tparams, params, body, loc) = noUnique $ do
           concat $ M.elems $ M.intersectionWith returnAliasing ets1 ets2
         returnAliasing expected got =
           [(uniqueness expected, S.map aliasVar $ aliases got)]
+
+checkGlobalAliases :: [Pattern] -> CompType -> SrcLoc -> TermTypeM ()
+checkGlobalAliases params body_t loc = do
+  vtable <- asks scopeVtable
+  let isLocal v = case v `M.lookup` vtable of
+                    Just (BoundV Local _ _) -> True
+                    _ -> False
+  let als = filter (not . isLocal) $ S.toList $
+            boundArrayAliases body_t `S.difference`
+            S.map identName (mconcat (map patIdentSet params))
+  case als of
+    v:_ | not $ null params ->
+      typeError loc $
+      unlines [ "Function result aliases the free variable " <>
+                quote (prettyName v) <> "."
+              , "Use " ++ quote "copy" ++ " to break the aliasing."]
+    _ ->
+      return ()
+
 
 inferReturnUniqueness :: [Pattern] -> CompType -> StructType
 inferReturnUniqueness params t =

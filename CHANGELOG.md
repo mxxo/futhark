@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [0.10.0]
+
+## [0.11.0]
+
+### Added
+
+### Removed
+
+### Changed
+
+### Fixed
+
+## [0.10.1]
 
 ### Added
 
@@ -26,6 +37,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   * Generated executables now support a `--tuning` flag for passing
     many tuned sizes in a file.
 
+  * Executables generated with the `cuda` backend now take an
+    `--nvrtc-option` option.
+
+  * Executables generated with the `opencl` backend now take a
+    `--build-option` option.
+
 ### Removed
 
   * The old `futhark-*` executables have been removed.
@@ -44,6 +61,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
     0.  This only affects the text output and the generated JSON
     files, and fits the tuple element ordering in Futhark.
 
+  * String literals are now of type `[]u8` and contain UTF-8 encoded
+    bytes.
+
 ### Fixed
 
   * An significant problematic interaction between empty arrays and
@@ -55,6 +75,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   * Fixed a major potential out-of-bounds access when sequentialising
     `reduce_by_index` (in most cases the bug was hidden by subsequent
     C compiler optimisations).
+
+  * The result of an anonymous function is now also forbidden from
+    aliasing a global variable, just as with named functions.
+
+  * Parallel scans now work correctly when using a CPU OpenCL
+    implementation.
+
+  * `reduce_by_index` was broken on newer NVIDIA GPUs when using fancy
+    operators.  This has been fixed.
 
 ## [0.9.1]
 

@@ -85,7 +85,8 @@ cliOptions = [ Option { optionLongName = "platform"
              , Option { optionLongName = "dump-opencl"
                       , optionShortName = Nothing
                       , optionArgument = RequiredArgument "FILE"
-                      , optionAction = [C.cstm|futhark_context_config_dump_program_to(cfg, optarg);|]
+                      , optionAction = [C.cstm|{futhark_context_config_dump_program_to(cfg, optarg);
+                                                entry_point = NULL;}|]
                       }
              , Option { optionLongName = "load-opencl"
                       , optionShortName = Nothing
@@ -95,12 +96,18 @@ cliOptions = [ Option { optionLongName = "platform"
              , Option { optionLongName = "dump-opencl-binary"
                       , optionShortName = Nothing
                       , optionArgument = RequiredArgument "FILE"
-                      , optionAction = [C.cstm|futhark_context_config_dump_binary_to(cfg, optarg);|]
+                      , optionAction = [C.cstm|{futhark_context_config_dump_binary_to(cfg, optarg);
+                                                entry_point = NULL;}|]
                       }
              , Option { optionLongName = "load-opencl-binary"
                       , optionShortName = Nothing
                       , optionArgument = RequiredArgument "FILE"
                       , optionAction = [C.cstm|futhark_context_config_load_binary_from(cfg, optarg);|]
+                      }
+             , Option { optionLongName = "build-option"
+                      , optionShortName = Nothing
+                      , optionArgument = RequiredArgument "OPT"
+                      , optionAction = [C.cstm|futhark_context_config_add_build_option(cfg, optarg);|]
                       }
              , Option { optionLongName = "print-sizes"
                       , optionShortName = Nothing

@@ -60,14 +60,11 @@ compiled to libraries.  If an entry point *returns* any such value,
 its printed representation is unspecified.  As a special case, an
 entry point is allowed to return a flat tuple.
 
-Instead of compiling, there is also an interpreter, ``futharki``.  Be
-aware that it is very slow, and does not produce better error messages
-than the compiler.  **Note:** If you run ``futharki`` without any
-options, you will see something that looks deceptively like a `REPL`_,
-but it is not yet finished, and only marginally useful in its present
-state.
+Instead of compiling, there is also an interpreter, accessible as
+``futhark run`` and ``futhark repl``.  The latter is an interactive
+prompt, useful for experimenting with Futhark expressions.  Be aware
+that the interpreter runs code very slowly.
 
-.. _REPL: https://en.wikipedia.org/wiki/Read%E2%80%93eval%E2%80%93print_loop
 
 .. _executable-options:
 
@@ -155,8 +152,9 @@ OpenCL backends (``opencl``, ``pyopencl``, and ``csopencl``):
 
   ``--dump-opencl FILE``
 
-    Dump the embedded OpenCL program to the indicated file.  Useful if
-    you want to see what is actually being executed.
+    Don't run the program, but instead dump the embedded OpenCL
+    program to the indicated file.  Useful if you want to see what is
+    actually being executed.
 
   ``--load-opencl FILE``
 
@@ -167,12 +165,21 @@ OpenCL backends (``opencl``, ``pyopencl``, and ``csopencl``):
 
   ``--dump-opencl-binary FILE``
 
-    Dump the compiled version of the embedded OpenCL program to the
-    indicated file.  On NVIDIA platforms, this will be PTX code.
+    Don't run the program, but instead dump the compiled version of
+    the embedded OpenCL program to the indicated file.  On NVIDIA
+    platforms, this will be PTX code.  If this option is set, no entry
+    point will be run.
 
   ``--load-opencl-binary FILE``
 
     Load an OpenCL binary from the indicated file.
+
+  ``--build-option OPT``
+
+    Add an additional build option to the string passed to
+    ``clBuildProgram()``.  Refer to the OpenCL documentation for which
+    options are supported.  Be careful - some options can easily
+    result in invalid results.
 
 There is rarely a need to use both ``-p`` and ``-d``.  For example, to
 run on the first available NVIDIA GPU, ``-p NVIDIA`` is sufficient, as
@@ -191,8 +198,9 @@ The following options are supported by executables generated the
 
   ``--dump-cuda FILE``
 
-    Dump the embedded CUDA program to the indicated file.  Useful if
-    you want to see what is actually being executed.
+    Don't run the program, but instead dump the embedded CUDA program
+    to the indicated file.  Useful if you want to see what is actually
+    being executed.
 
   ``--load-cuda FILE``
 
@@ -207,7 +215,16 @@ The following options are supported by executables generated the
 
   ``--load-ptx FILE``
 
-    Load compiled PTX code from the indicated file.
+    Don't run the program, but instead load compiled PTX code from the
+    indicated file.
+
+  ``--nvrtc-option=OPT``
+
+    Add the given option to the command line used to compile CUDA
+    kernels with NVRTC.  The list supported options varies on the
+    version of CUDA being used and is `found in the NVRTC
+    documentation
+    <https://docs.nvidia.com/cuda/nvrtc/index.html#group__options>`_.
 
 Compiling to Library
 --------------------
