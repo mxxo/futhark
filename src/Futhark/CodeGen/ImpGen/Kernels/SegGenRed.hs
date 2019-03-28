@@ -442,7 +442,7 @@ genRedKernelLocal map_pes space ops body = do
     ImpGen.sOp Imp.LocalBarrier
 
     chunk <- newVName "chunk"
-    sFor chunk Int64 (img_size `quot` kernelGroupSize constants) $
+    sFor chunk Int64 (img_size `quotRoundingUp` kernelGroupSize constants) $
       sFor i Int64 (Imp.var elems_per_thread_64 int64) $ do
         -- Compute the offset into the input and output.  To this a
         -- thread can add its local ID to figure out which element it is
@@ -457,7 +457,6 @@ genRedKernelLocal map_pes space ops body = do
 
                   -- Chunk.
                   + Imp.var chunk int64 * i32_to_i64 (kernelGroupSize constants)
-                  + i32_to_i64 (kernelLocalThreadId constants)
 
         j <- dPrimV "j" $ Imp.var offset int64 + i32_to_i64 (kernelLocalThreadId constants)
 
