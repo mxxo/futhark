@@ -35,13 +35,13 @@ import Futhark.Construct (fullSliceNum)
 
 import Debug.Trace
 
-prepareAtomicUpdate :: Space -> Maybe Locking -> [VName] -> Lambda InKernel
-                    -> CallKernelGen (Maybe Locking,
-                                      [Imp.Exp] -> ImpGen.ImpM InKernel Imp.KernelOp ())
-prepareAtomicUpdate space l dests lam =
+prepareAtomicUpdateGlobal :: Maybe Locking -> [VName] -> Lambda InKernel
+                          -> CallKernelGen (Maybe Locking,
+                                            [Imp.Exp] -> ImpGen.ImpM InKernel Imp.KernelOp ())
+prepareAtomicUpdateGlobal l dests lam =
   -- We need a separate lock array if the opterators are not all of a
   -- particularly simple form that permits pure atomic operations.
-  case (l, atomicUpdateLocking space lam) of
+  case (l, atomicUpdateLocking (Space "global") lam) of
     (_, Left f) -> return (l, f dests)
     (Just l', Right f) -> return (l, f l' dests)
     (Nothing, Right f) -> do
@@ -276,6 +276,21 @@ compileSegGenRedGlobal (Pattern _ pes) genred_space ops body = do
           ImpGen.copyDWIM d is (Var subhisto) $ map (`Imp.var` int32) $
           map fst segment_dims ++ [subhistogram_id, bucket_id] ++ vector_ids
 
+prepareAtomicUpdateLocal :: SubExp -> Maybe Locking -> [VName] -> Lambda InKernel
+                         -> CallKernelGen (Maybe Locking,
+                                           [Imp.Exp] -> ImpGen.ImpM InKernel Imp.KernelOp ())
+prepareAtomicUpdateLocal num_locks l dests lam =
+  -- We need a separate lock array if the opterators are not all of a
+  -- particularly simple form that permits pure atomic operations.
+  case (l, atomicUpdateLocking (Space "local") lam) of
+    (_, Left f) -> return (l, f dests)
+    (Just l', Right f) -> return (l, f l' dests)
+    (Nothing, Right f) -> do
+      locks <- ImpGen.sAllocArray "genred_locks" int32 (Shape [num_locks]) $ Space "local"
+      num_locks' <- ImpGen.compileSubExp num_locks
+      let l' = Locking locks 0 1 0 $ (`rem` num_locks') . sum
+      return (Just l', f l' dests)
+
 -- XXX: Reuse code.
 prepareIntermediateArraysLocal :: KernelSpace -> [SubExp] -> Imp.Exp -> Imp.Exp -> [GenReduceOp InKernel]
                                -> CallKernelGen
@@ -371,7 +386,8 @@ prepareIntermediateArraysLocal space segment_dims num_threads num_groups = fmap 
 
         return (subhisto, subhistogram_local)
 
-      (l', do_op) <- prepareAtomicUpdate (Space "local") l (map snd dests) $ genReduceOp op
+      (l', do_op) <- prepareAtomicUpdateLocal (genReduceWidth op)
+                     l (map snd dests) $ genReduceOp op
 
       return (l', (num_hists', dests, do_op, (coop_lvl', group_hists_size')))
 
