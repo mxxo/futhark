@@ -124,7 +124,6 @@ import Futhark.Optimise.Simplify.Lore
 import Futhark.Representation.Aliases
   (Aliases, removeScopeAliases, removeExpAliases, removePatternAliases)
 import Futhark.Representation.AST.Attributes.Ranges
-import Futhark.Analysis.Usage
 import qualified Futhark.Analysis.SymbolTable as ST
 
 -- | A lore containing explicit memory information.
@@ -211,10 +210,6 @@ instance IsOp inner => IsOp (MemOp inner) where
   safeOp (Inner k) = safeOp k
   cheapOp (Inner k) = cheapOp k
   cheapOp Alloc{} = True
-
-instance UsageInOp inner => UsageInOp (MemOp inner) where
-  usageInOp Alloc {} = mempty
-  usageInOp (Inner k) = usageInOp k
 
 instance CanBeWise inner => CanBeWise (MemOp inner) where
   type OpWithWisdom (MemOp inner) = MemOp (OpWithWisdom inner)
@@ -1013,9 +1008,6 @@ instance OpReturns ExplicitMemory where
   opReturns (Inner (HostOp k@(Kernel _ _ _ body))) =
     zipWithM correct (kernelBodyResult body) =<< (extReturns <$> opType k)
     where correct (WriteReturn _ arr _) _ = varReturns arr
-          correct (KernelInPlaceReturn arr) _ =
-            extendedScope (varReturns arr)
-            (castScope $ scopeOf $ kernelBodyStms body)
           correct _ ret = return ret
   opReturns (Inner (HostOp (SegGenRed _ ops _ _))) =
     concat <$> mapM (mapM varReturns . genReduceDest) ops

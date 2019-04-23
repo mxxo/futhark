@@ -389,8 +389,11 @@ applyFunctor applyloc (FunSig p_abs p_mod body_mty) a_mty = do
 
   -- Apply type abbreviations from a_mty to body_mty.
   let a_abbrs = mtyTypeAbbrs a_mty
-  let type_subst = M.mapMaybe (fmap TypeSub . (`M.lookup` a_abbrs)) p_subst
-  let body_mty' = substituteTypesInMTy type_subst body_mty
+      isSub v = case M.lookup v a_abbrs of
+                  Just abbr -> Just $ TypeSub abbr
+                  _  -> Just $ DimSub $ NamedDim $ qualName v
+      type_subst = M.mapMaybe isSub p_subst
+      body_mty' = substituteTypesInMTy type_subst body_mty
   (body_mty'', body_subst) <- newNamesForMTy body_mty'
   return (body_mty'', p_subst, body_subst)
 
@@ -696,8 +699,11 @@ matchMTys = matchMTys' mempty
     matchVal loc spec_name spec_t name t
       | matchFunBinding loc spec_t t = return (spec_name, name)
     matchVal loc spec_name spec_v _ v =
-      Left $ TypeError loc $ "Value " ++ quote (baseString spec_name) ++ " specified as type " ++
-      ppValBind spec_v ++ " in signature, but has " ++ ppValBind v ++ " in structure."
+      Left $ TypeError loc $ unlines $
+      ["Module type specifies"] ++
+      map ("  "++) (lines $ ppValBind spec_name spec_v) ++
+      ["but module provides"] ++
+      map ("  "++) (lines $ppValBind spec_name v)
 
     matchFunBinding :: SrcLoc -> BoundV -> BoundV -> Bool
     matchFunBinding loc (BoundV _ orig_spec_t) (BoundV tps orig_t) =
@@ -752,7 +758,8 @@ matchMTys = matchMTys' mempty
                indent $ ppTypeAbbr abs name mod_t,
                "but module type requires this type to be non-functional."]
 
-    ppValBind (BoundV tps t) = unwords $ map pretty tps ++ [pretty t]
+    ppValBind v (BoundV tps t) =
+      unwords $ ["val", prettyName v] ++ map pretty tps ++ [":", pretty t]
 
     ppTypeAbbr abs name (ps, t) =
       "type " ++ unwords (pretty name : map pretty ps) ++ t'
@@ -804,6 +811,10 @@ substituteTypesInEnv substs env =
   where subT name _
           | Just (TypeSub (TypeAbbr l ps t)) <- M.lookup name substs = TypeAbbr l ps t
         subT _ (TypeAbbr l ps t) = TypeAbbr l ps $ substituteTypes substs t
+
+substituteTypesInBoundV :: TypeSubs -> BoundV -> BoundV
+substituteTypesInBoundV substs (BoundV tps t) =
+  BoundV tps (substituteTypes substs t)
 
 allNamesInMTy :: MTy -> S.Set VName
 allNamesInMTy (MTy abs mod) =

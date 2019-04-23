@@ -1,4 +1,3 @@
------------------------------------------------------------------------------
 -- |
 --
 -- Functions for generic traversals across Futhark syntax trees.  The
@@ -16,14 +15,12 @@
 -- tree.  The implementation is rather tedious, but the interface is
 -- easy to use.
 --
--- A traversal of the Futhark syntax tree is expressed as a tuple of
+-- A traversal of the Futhark syntax tree is expressed as a record of
 -- functions expressing the operations to be performed on the various
 -- types of nodes.
 --
--- The "Futhark.Transform.Rename" is a simple example of how to use
--- this facility.
---
------------------------------------------------------------------------------
+-- The "Futhark.Transform.Rename" module is a simple example of how to
+-- use this facility.
 module Futhark.Representation.AST.Traversals
   (
   -- * Mapping
@@ -62,7 +59,6 @@ data Mapper flore tlore m = Mapper {
     -- ^ Most bodies are enclosed in a scope, which is passed along
     -- for convenience.
   , mapOnVName :: VName -> m VName
-  , mapOnCertificates :: Certificates -> m Certificates
   , mapOnRetType :: RetType flore -> m (RetType tlore)
   , mapOnBranchType :: BranchType flore -> m (BranchType tlore)
   , mapOnFParam :: FParam flore -> m (FParam tlore)
@@ -76,7 +72,6 @@ identityMapper = Mapper {
                    mapOnSubExp = return
                  , mapOnBody = const return
                  , mapOnVName = return
-                 , mapOnCertificates = return
                  , mapOnRetType = return
                  , mapOnBranchType = return
                  , mapOnFParam = return
@@ -203,7 +198,6 @@ data Walker lore m = Walker {
     walkOnSubExp :: SubExp -> m ()
   , walkOnBody :: Body lore -> m ()
   , walkOnVName :: VName -> m ()
-  , walkOnCertificates :: Certificates -> m ()
   , walkOnRetType :: RetType lore -> m ()
   , walkOnBranchType :: BranchType lore -> m ()
   , walkOnFParam :: FParam lore -> m ()
@@ -217,7 +211,6 @@ identityWalker = Walker {
                    walkOnSubExp = const $ return ()
                  , walkOnBody = const $ return ()
                  , walkOnVName = const $ return ()
-                 , walkOnCertificates = const $ return ()
                  , walkOnRetType = const $ return ()
                  , walkOnBranchType = const $ return ()
                  , walkOnFParam = const $ return ()
@@ -230,7 +223,6 @@ walkMapper f = Mapper {
                  mapOnSubExp = wrap walkOnSubExp
                , mapOnBody = const $ wrap walkOnBody
                , mapOnVName = wrap walkOnVName
-               , mapOnCertificates = wrap walkOnCertificates
                , mapOnRetType = wrap walkOnRetType
                , mapOnBranchType = wrap walkOnBranchType
                , mapOnFParam = wrap walkOnFParam

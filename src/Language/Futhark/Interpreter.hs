@@ -555,7 +555,7 @@ eval env (RecordLit fields _) =
           v <- eval env e
           return (k, v)
         evalField (RecordFieldImplicit k t loc) = do
-          v <- eval env $ Var (qualName k) (vacuousShapeAnnotations <$> t) loc
+          v <- eval env $ Var (qualName k) t loc
           return (baseName k, v)
 
 eval env (ArrayLit vs _ _) = toArray =<< mapM (eval env) vs
@@ -584,7 +584,7 @@ eval env (Range start maybe_second end (Info t) _) = do
 
 eval env (Var qv _ _) = evalTermVar env qv
 
-eval env (Ascript e td loc) = do
+eval env (Ascript e td _ loc) = do
   v <- eval env e
   let t = evalType env $ unInfo $ expandedType td
   case matchValueToType env t v of
@@ -592,7 +592,7 @@ eval env (Ascript e td loc) = do
     Left err -> bad loc env $ "Value `" <> pretty v <> "` cannot match shape of type `" <>
                 pretty (declaredType td) <> "` (`" <> pretty t <> "`): " ++ err
 
-eval env (LetPat _ p e body _) = do
+eval env (LetPat _ p e body _ _) = do
   v <- eval env e
   env' <- matchPattern env p v
   eval env' body
@@ -677,11 +677,11 @@ eval env (RecordUpdate src all_fs v _ _) =
               ValueRecord $ M.insert f (update f_v fs v') src'
         update _ _ _ = error "eval RecordUpdate: invalid value."
 
-eval env (LetWith dest src is v body loc) = do
+eval env (LetWith dest src is v body _ loc) = do
   dest' <- maybe oob return =<<
     updateArray <$> mapM (evalDimIndex env) is <*>
     evalTermVar env (qualName $ identName src) <*> eval env v
-  let t = T.BoundV [] $ vacuousShapeAnnotations $ toStruct $ unInfo $ identType dest
+  let t = T.BoundV [] $ toStruct $ unInfo $ identType dest
   eval (valEnv (M.singleton (identName dest) (Just t, dest')) <> env) body
   where oob = bad loc env "Bad update"
 
@@ -795,8 +795,6 @@ eval env (Match e cs _ _) = do
           case c' of
             Just v' -> return v'
             Nothing -> match v cs'
-
-eval _ e = error $ "eval not yet: " ++ show e
 
 evalCase :: Value -> Env -> CaseBase Info VName
          -> EvalM (Maybe Value)

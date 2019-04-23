@@ -9,7 +9,9 @@ module Futhark.CodeGen.ImpGen.Kernels.Base
   , CallKernelGen
   , InKernelGen
   , computeThreadChunkSize
+  , simpleKernelConstants
   , kernelInitialisation
+  , kernelInitialisationSimple
   , kernelInitialisationSetSpace
   , setSpaceIndices
   , makeAllMemoryGlobal
@@ -22,6 +24,7 @@ module Futhark.CodeGen.ImpGen.Kernels.Base
   , sReplicate
   , sIota
   , sCopy
+  , compileKernelResult
 
   , atomicUpdate
   , atomicUpdateLocking
@@ -51,7 +54,6 @@ import Futhark.CodeGen.ImpGen ((<--),
                                sFor, sWhile, sComment, sIf, sWhen, sUnless,
                                sOp,
                                dPrim, dPrim_, dPrimV)
-import Futhark.Tools (partitionChunkedKernelLambdaParameters)
 import Futhark.Util.IntegralExp (quotRoundingUp, quot, rem, IntegralExp)
 import Futhark.Util (splitAt3, maybeNth, takeLast)
 
@@ -94,6 +96,9 @@ inKernelCopy = ImpGen.copyElementWise
 
 compileInKernelOp :: KernelConstants -> Pattern InKernel -> Op InKernel
                   -> InKernelGen ()
+compileInKernelOp _ (Pattern _ [mem]) (Alloc size (Space "private")) = do
+  size' <- ImpGen.compileSubExp size
+  sOp $ Imp.PrivateAlloc (patElemName mem) $ Imp.bytes size'
 compileInKernelOp _ (Pattern _ [mem]) Alloc{} =
   compilerLimitationS $ "Cannot allocate memory block " ++ pretty mem ++ " in kernel."
 compileInKernelOp _ dest Alloc{} =
@@ -166,7 +171,7 @@ compileKernelExp constants pat (Combine (CombineSpace scatter cspace) _ aspace b
 
     -- Execute the body if we are within bounds.
     sWhen (isActive cspace .&&. isActive aspace) $ allThreads constants $
-      ImpGen.compileStms (freeIn $ bodyResult body) (stmsToList $ bodyStms body) $ do
+      ImpGen.compileStms (freeIn $ bodyResult body) (bodyStms body) $ do
 
       forM_ (zip4 scatter_ws_repl res_is res_vs scatter_pes) $
         \(w, res_i, res_v, scatter_pe) -> do
@@ -189,14 +194,8 @@ compileKernelExp constants pat (Combine (CombineSpace scatter cspace) _ aspace b
         local_index = map (ImpGen.compileSubExpOfType int32 . Var . fst) cspace
 
 compileKernelExp constants (Pattern _ dests) (GroupReduce w lam input) = do
-  let [my_index_param, offset_param] = take 2 $ lambdaParams lam
-      lam' = lam { lambdaParams = drop 2 $ lambdaParams lam }
-
-  dPrim_ (paramName my_index_param) int32
-  dPrim_ (paramName offset_param) int32
-  paramName my_index_param <-- kernelGlobalThreadId constants
   w' <- ImpGen.compileSubExp w
-  groupReduceWithOffset constants (paramName offset_param) w' lam' $ map snd input
+  groupReduce constants w' lam $ map snd input
 
   sOp Imp.LocalBarrier
 
@@ -339,13 +338,13 @@ atomicUpdateLocking :: ExplicitMemorish lore =>
 
 atomicUpdateLocking space lam
   | Just ops_and_ts <- splitOp lam,
-    all (\(_, t, _) -> primBitSize t == 32) ops_and_ts = Left $ \arrs bucket ->
+    all (\(_, t, _, _) -> primBitSize t == 32) ops_and_ts = Left $ \arrs bucket ->
   -- If the operator is a vectorised binary operator on 32-bit values,
   -- we can use a particularly efficient implementation. If the
   -- operator has an atomic implementation we use that, otherwise it
   -- is still a binary operator which can be implemented by atomic
   -- compare-and-swap if 32 bits.
-  forM_ (zip arrs ops_and_ts) $ \(a, (op, t, val)) -> do
+  forM_ (zip arrs ops_and_ts) $ \(a, (op, t, x, y)) -> do
 
   -- Common variables.
   old <- dPrim "old" t
@@ -353,46 +352,24 @@ atomicUpdateLocking space lam
   (arr', _a_space, bucket_offset) <- ImpGen.fullyIndexArray a bucket
 
   case opHasAtomicSupport old arr' bucket_offset op of
-    Just f -> sOp $ f val
-
-    Nothing -> do
-      -- Code generation target:
-      --
-      -- old = d_his[idx];
-      -- do {
-      --   assumed = old;
-      --   tmp = OP::apply(val, assumed);
-      --   old = atomicCAS(&d_his[idx], assumed, tmp);
-      -- } while(assumed != old);
-      assumed <- dPrim "assumed" t
-      run_loop <- dPrimV "run_loop" 1
-      ImpGen.copyDWIM old [] (Var a) bucket
-
-      -- Critical section
-      x <- dPrim "x" t
-      y <- dPrim "y" t
-
-      -- While-loop: Try to insert your value
-      let (toBits, fromBits) =
-            case t of FloatType Float32 -> (\v -> Imp.FunExp "to_bits32" [v] int32,
-                                            \v -> Imp.FunExp "from_bits32" [v] t)
-                      _                 -> (id, id)
-      sWhile (Imp.var run_loop int32) $ do
-        assumed <-- Imp.var old t
-        x <-- val
-        y <-- Imp.var assumed t
-        x <-- Imp.BinOpExp op (Imp.var x t) (Imp.var y t)
-        old_bits <- dPrim "old_bits" int32
-        sOp $ Imp.Atomic space $
-          Imp.AtomicCmpXchg old_bits arr' bucket_offset
-          (toBits (Imp.var assumed t)) (toBits (Imp.var x t))
-        old <-- fromBits (Imp.var old_bits int32)
-        sWhen (toBits (Imp.var assumed t) .==. Imp.var old_bits int32)
-          (run_loop <-- 0)
+    Just f -> sOp $ f $ Imp.var y t
+    Nothing -> atomicUpdateCAS space t a old bucket x $
+      x <-- Imp.BinOpExp op (Imp.var x t) (Imp.var y t)
 
   where opHasAtomicSupport old arr' bucket' bop = do
           let atomic f = Imp.Atomic space . f old arr' bucket'
           atomic <$> Imp.atomicBinOp bop
+
+-- If the operator functions purely on single 32-bit values, we can
+-- use an implementation based on CAS, no matter what the operator
+-- does.
+atomicUpdateLocking space op
+  | [Prim t] <- lambdaReturnType op,
+    [xp, _] <- lambdaParams op,
+    primBitSize t == 32 = Left $ \[arr] bucket -> do
+      old <- dPrim "old" t
+      atomicUpdateCAS space t arr old bucket (paramName xp) $
+        ImpGen.compileBody' [xp] $ lambdaBody op
 
 atomicUpdateLocking space op = Right $ \locking arrs bucket -> do
   old <- dPrim "old" int32
@@ -453,8 +430,45 @@ atomicUpdateLocking space op = Right $ \locking arrs bucket -> do
     sOp Imp.MemFence
   where writeArray bucket arr val = ImpGen.copyDWIM arr bucket val []
 
+atomicUpdateCAS :: Space -> PrimType
+                -> VName -> VName
+                -> [Imp.Exp] -> VName
+                -> ImpGen.ImpM lore Imp.KernelOp ()
+                -> ImpGen.ImpM lore Imp.KernelOp ()
+atomicUpdateCAS space t arr old bucket x do_op = do
+  -- Code generation target:
+  --
+  -- old = d_his[idx];
+  -- do {
+  --   assumed = old;
+  --   x = do_op(assumed, y);
+  --   old = atomicCAS(&d_his[idx], assumed, tmp);
+  -- } while(assumed != old);
+  assumed <- dPrim "assumed" t
+  run_loop <- dPrimV "run_loop" 1
+  ImpGen.copyDWIM old [] (Var arr) bucket
+
+  (arr', _a_space, bucket_offset) <- ImpGen.fullyIndexArray arr bucket
+
+  -- While-loop: Try to insert your value
+  let (toBits, fromBits) =
+        case t of FloatType Float32 -> (\v -> Imp.FunExp "to_bits32" [v] int32,
+                                        \v -> Imp.FunExp "from_bits32" [v] t)
+                  _                 -> (id, id)
+  sWhile (Imp.var run_loop int32) $ do
+    assumed <-- Imp.var old t
+    x <-- Imp.var assumed t
+    do_op
+    old_bits <- dPrim "old_bits" int32
+    sOp $ Imp.Atomic space $
+      Imp.AtomicCmpXchg old_bits arr' bucket_offset
+      (toBits (Imp.var assumed t)) (toBits (Imp.var x t))
+    old <-- fromBits (Imp.var old_bits int32)
+    sWhen (toBits (Imp.var assumed t) .==. Imp.var old_bits int32)
+      (run_loop <-- 0)
+
 -- | Horizontally fission a lambda that models a binary operator.
-splitOp :: Attributes lore => Lambda lore -> Maybe [(BinOp, PrimType, Imp.Exp)]
+splitOp :: Attributes lore => Lambda lore -> Maybe [(BinOp, PrimType, VName, VName)]
 splitOp lam = mapM splitStm $ bodyResult $ lambdaBody lam
   where n = length $ lambdaReturnType lam
         splitStm (Var res) = do
@@ -467,7 +481,7 @@ splitOp lam = mapM splitStm $ bodyResult $ lambdaBody lam
           guard $ paramName xp == x
           guard $ paramName yp == y
           Prim t <- Just $ patElemType pe
-          return (op, t, Imp.var (paramName yp) t)
+          return (op, t, paramName xp, paramName yp)
         splitStm _ = Nothing
 
 computeKernelUses :: FreeIn a =>
@@ -536,6 +550,8 @@ isConstExp v = do
 isStaticExp :: Imp.KernelConstExp -> Bool
 isStaticExp LeafExp{} = True
 isStaticExp ValueExp{} = True
+isStaticExp (ConvOpExp ZExt{} x) = isStaticExp x
+isStaticExp (ConvOpExp SExt{} x) = isStaticExp x
 isStaticExp (BinOpExp Add{} x y) = isStaticExp x && isStaticExp y
 isStaticExp (BinOpExp Sub{} x y) = isStaticExp x && isStaticExp y
 isStaticExp (BinOpExp Mul{} x y) = isStaticExp x && isStaticExp y
@@ -574,36 +590,37 @@ computeThreadChunkSize SplitContiguous thread_index elements_per_thread num_elem
           Imp.innerExp num_elements .<.
           (thread_index + 1) * Imp.innerExp elements_per_thread
 
-kernelInitialisationSetSpace :: KernelSpace -> InKernelGen ()
-                             -> ImpGen.ImpM lore op (KernelConstants, ImpGen.ImpM InKernel Imp.KernelOp ())
-kernelInitialisationSetSpace space set_space = do
-  group_size' <- ImpGen.compileSubExp $ spaceGroupSize space
-  num_threads' <- ImpGen.compileSubExp $ spaceNumThreads space
-  num_groups <- ImpGen.compileSubExp $ spaceNumGroups space
-
-  let global_tid = spaceGlobalId space
-      local_tid = spaceLocalId space
-      group_id = spaceGroupId space
+kernelInitialisationSimple :: Imp.Exp -> Imp.Exp
+                           -> Maybe (VName, VName, VName)
+                           -> ImpGen.ImpM lore op (KernelConstants, ImpGen.ImpM InKernel Imp.KernelOp ())
+kernelInitialisationSimple num_groups group_size names = do
+  (global_tid, local_tid, group_id) <-
+    case names of Nothing ->
+                    (,,)
+                    <$> newVName "global_tid"
+                    <*> newVName "local_tid"
+                    <*> newVName "group_id"
+                  Just (global_tid, local_tid, group_id) ->
+                    return (global_tid, local_tid, group_id)
   wave_size <- newVName "wave_size"
   inner_group_size <- newVName "group_size"
 
-  let (space_is, space_dims) = unzip $ spaceDimensions space
-  space_dims' <- mapM ImpGen.compileSubExp space_dims
   let constants =
         KernelConstants
         (Imp.var global_tid int32)
         (Imp.var local_tid int32)
         (Imp.var group_id int32)
         global_tid local_tid group_id
-        group_size' num_groups num_threads'
-        (Imp.var wave_size int32) (zip space_is space_dims')
-        (if null (spaceDimensions space)
-         then true else isActive (spaceDimensions space)) mempty
+        group_size num_groups (group_size*num_groups)
+        (Imp.var wave_size int32) []
+        true mempty
 
   let set_constants = do
-        dPrim_ wave_size int32
+        dPrim_ global_tid int32
+        dPrim_ local_tid int32
         dPrim_ inner_group_size int32
-        ImpGen.dScope Nothing (scopeOfKernelSpace space)
+        dPrim_ wave_size int32
+        dPrim_ group_id int32
 
         sOp (Imp.GetGlobalId global_tid 0)
         sOp (Imp.GetLocalId local_tid 0)
@@ -611,9 +628,39 @@ kernelInitialisationSetSpace space set_space = do
         sOp (Imp.GetLockstepWidth wave_size)
         sOp (Imp.GetGroupId group_id 0)
 
+  return (constants, set_constants)
+
+kernelInitialisationSetSpace :: KernelSpace -> InKernelGen ()
+                             -> ImpGen.ImpM lore op (KernelConstants, ImpGen.ImpM InKernel Imp.KernelOp ())
+kernelInitialisationSetSpace space set_space = do
+  group_size <- ImpGen.compileSubExp $ spaceGroupSize space
+  num_groups <- ImpGen.compileSubExp $ spaceNumGroups space
+
+  (constants, set_constants) <-
+    kernelInitialisationSimple num_groups group_size $
+    Just (spaceGlobalId space, spaceLocalId space, spaceGroupId space)
+
+  let set_constants' = do
+        set_constants
+        case spaceStructure space of
+          FlatThreadSpace is_and_dims ->
+            mapM_ ((`dPrim_` int32) . fst) is_and_dims
+          NestedThreadSpace is_and_dims -> do
+            let (gtids, _, ltids, _) = unzip4 is_and_dims
+            mapM_ (`dPrim_` int32) $ gtids ++ ltids
         set_space
 
-  return (constants, set_constants)
+  let (space_is, space_dims) = unzip $ spaceDimensions space
+  space_dims' <- mapM ImpGen.compileSubExp space_dims
+
+  return (constants { kernelThreadActive =
+                        if null $ spaceDimensions space
+                        then true
+                        else isActive $ spaceDimensions space
+                    , kernelDimensions =
+                        zip space_is space_dims'
+                    },
+          set_constants')
 
 kernelInitialisation :: KernelSpace
                      -> ImpGen.ImpM lore op (KernelConstants, ImpGen.ImpM InKernel Imp.KernelOp ())
@@ -636,8 +683,7 @@ setSpaceIndices gtid space =
   where flatSpaceWith base is_and_dims = do
           let (is, dims) = unzip is_and_dims
           dims' <- mapM ImpGen.compileSubExp dims
-          let index_expressions = unflattenIndex dims' base
-          zipWithM_ (<--) is index_expressions
+          zipWithM_ (<--) is $ unflattenIndex dims' base
 
 isActive :: [(VName, SubExp)] -> Imp.Exp
 isActive limit = case actives of
@@ -696,13 +742,13 @@ writeParamToLocalMemory i (mem, _) param
         bt = elemType $ paramType param
 
 readParamFromLocalMemory :: Typed (MemBound u) =>
-                            VName -> Imp.Exp -> Param (MemBound u) -> (VName, t)
+                            Imp.Exp -> Param (MemBound u) -> (VName, t)
                          -> ImpGen.ImpM lore op ()
-readParamFromLocalMemory index i param (l_mem, _)
+readParamFromLocalMemory i param (l_mem, _)
   | Prim _ <- paramType param =
       paramName param <--
       Imp.index l_mem (bytes i') bt (Space "local") Imp.Volatile
-  | otherwise = index <-- i
+  | otherwise = return ()
   where i' = i * Imp.LeafExp (Imp.SizeOf bt) int32
         bt = elemType $ paramType param
 
@@ -818,12 +864,9 @@ groupScan constants seg_flag w lam arrs = do
                          ImpGen.lookupArray) arrs
 
   let ltid = kernelLocalThreadId constants
-      (lam_i, other_index_param, actual_params) =
-        partitionChunkedKernelLambdaParameters $ lambdaParams lam
-      (x_params, y_params) = splitAt (length arrs) actual_params
+      (x_params, y_params) = splitAt (length arrs) $ lambdaParams lam
 
   ImpGen.dLParams (lambdaParams lam++lambdaParams renamed_lam)
-  lam_i <-- ltid
 
   -- The scan works by splitting the group into blocks, which are
   -- scanned separately.  Typically, these blocks are smaller than
@@ -864,8 +907,7 @@ groupScan constants seg_flag w lam arrs = do
   sOp Imp.LocalBarrier
 
   let read_carry_in =
-        zipWithM_ (readParamFromLocalMemory
-                   (paramName other_index_param) (block_id - 1))
+        zipWithM_ (readParamFromLocalMemory (block_id - 1))
         x_params acc_local_mem
 
   let op_to_y
@@ -902,19 +944,16 @@ inBlockScan seg_flag lockstep_width block_size active ltid acc_local_mem scan_la
   skip_threads <- dPrim "skip_threads" int32
   let in_block_thread_active =
         Imp.var skip_threads int32 .<=. in_block_id
-      (scan_lam_i, other_index_param, actual_params) =
-        partitionChunkedKernelLambdaParameters $ lambdaParams scan_lam
+      actual_params = lambdaParams scan_lam
       (x_params, y_params) =
         splitAt (length actual_params `div` 2) actual_params
       read_operands =
-        zipWithM_ (readParamFromLocalMemory (paramName other_index_param) $
-                   ltid - Imp.var skip_threads int32)
+        zipWithM_ (readParamFromLocalMemory $ ltid - Imp.var skip_threads int32)
         x_params acc_local_mem
 
   -- Set initial y values
   sWhen active $
-    zipWithM_ (readParamFromLocalMemory scan_lam_i ltid)
-    y_params acc_local_mem
+    zipWithM_ (readParamFromLocalMemory ltid) y_params acc_local_mem
 
   let op_to_y
         | Nothing <- seg_flag =
@@ -946,11 +985,11 @@ inBlockScan seg_flag lockstep_width block_size active ltid acc_local_mem scan_la
   where block_id = ltid `quot` block_size
         in_block_id = ltid - block_id * block_size
 
-compileKernelStms :: KernelConstants -> [Stm InKernel]
+compileKernelStms :: KernelConstants -> Stms InKernel
                   -> InKernelGen a
                   -> InKernelGen a
 compileKernelStms constants ungrouped_bnds m =
-  compileGroupedKernelStms' $ groupStmsByGuard constants ungrouped_bnds
+  compileGroupedKernelStms' $ groupStmsByGuard constants $ stmsToList ungrouped_bnds
   where compileGroupedKernelStms' [] = m
         compileGroupedKernelStms' ((g, bnds):rest_bnds) = do
           ImpGen.dScopes (map ((Just . stmExp) &&& (castScope . scopeOf)) bnds)
@@ -1094,3 +1133,81 @@ sCopy bt
     sWhen (gtid .<. kernel_size) $ ImpGen.emit $
       Imp.Write destmem destidx bt destspace Imp.Nonvolatile $
       Imp.index srcmem srcidx bt srcspace Imp.Nonvolatile
+
+
+compileKernelResult :: KernelConstants -> PatElem InKernel -> KernelResult
+                    -> InKernelGen ()
+
+compileKernelResult constants pe (GroupsReturn what) = do
+  i <- newVName "i"
+
+  in_local_memory <- arrayInLocalMemory what
+  let me = kernelLocalThreadId constants
+
+  if not in_local_memory then do
+    who' <- ImpGen.compileSubExp $ intConst Int32 0
+    sWhen (me .==. who') $
+      ImpGen.copyDWIM (patElemName pe) [kernelGroupId constants] what []
+    else do
+      -- If the result of the group is an array in local memory, we
+      -- store it by collective copying among all the threads of the
+      -- group.  TODO: also do this if the array is in global memory
+      -- (but this is a bit more tricky, synchronisation-wise).
+      --
+      -- We do the reads/writes multidimensionally, but the loop is
+      -- single-dimensional.
+      ws <- mapM ImpGen.compileSubExp . arrayDims =<< subExpType what
+      -- Compute how many elements this thread is responsible for.
+      -- Formula: (w - ltid) / group_size (rounded up).
+      let w = product ws
+          ltid = kernelLocalThreadId constants
+          group_size = kernelGroupSize constants
+          to_write = (w - ltid) `quotRoundingUp` group_size
+          is = unflattenIndex ws $ ImpGen.varIndex i * group_size + ltid
+
+      sFor i Int32 to_write $
+        ImpGen.copyDWIM (patElemName pe) (kernelGroupId constants : is) what is
+
+compileKernelResult constants pe (ThreadsReturn what) = do
+  let is = map (ImpGen.varIndex . fst) $ kernelDimensions constants
+  sWhen (kernelThreadActive constants) $ ImpGen.copyDWIM (patElemName pe) is what []
+
+compileKernelResult constants pe (ConcatReturns SplitContiguous _ per_thread_elems moffset what) = do
+  dest_loc <- ImpGen.entryArrayLocation <$> ImpGen.lookupArray (patElemName pe)
+  let dest_loc_offset = ImpGen.offsetArray dest_loc offset
+      dest' = ImpGen.arrayDestination dest_loc_offset
+  ImpGen.copyDWIMDest dest' [] (Var what) []
+  where offset = case moffset of
+                   Nothing -> ImpGen.compileSubExpOfType int32 per_thread_elems *
+                              kernelGlobalThreadId constants
+                   Just se -> ImpGen.compileSubExpOfType int32 se
+
+compileKernelResult constants pe (ConcatReturns (SplitStrided stride) _ _ moffset what) = do
+  dest_loc <- ImpGen.entryArrayLocation <$> ImpGen.lookupArray (patElemName pe)
+  let dest_loc' = ImpGen.strideArray
+                  (ImpGen.offsetArray dest_loc offset) $
+                  ImpGen.compileSubExpOfType int32 stride
+      dest' = ImpGen.arrayDestination dest_loc'
+  ImpGen.copyDWIMDest dest' [] (Var what) []
+  where offset = case moffset of
+                   Nothing -> kernelGlobalThreadId constants
+                   Just se -> ImpGen.compileSubExpOfType int32 se
+
+compileKernelResult constants pe (WriteReturn rws _arr dests) = do
+  rws' <- mapM ImpGen.compileSubExp rws
+  forM_ dests $ \(is, e) -> do
+    is' <- mapM ImpGen.compileSubExp is
+    let condInBounds i rw = 0 .<=. i .&&. i .<. rw
+        write = foldl (.&&.) (kernelThreadActive constants) $
+                zipWith condInBounds is' rws'
+    sWhen write $ ImpGen.copyDWIM (patElemName pe) (map (ImpGen.compileSubExpOfType int32) is) e []
+
+arrayInLocalMemory :: SubExp -> InKernelGen Bool
+arrayInLocalMemory (Var name) = do
+  res <- ImpGen.lookupVar name
+  case res of
+    ImpGen.ArrayVar _ entry ->
+      (Space "local"==) . ImpGen.entryMemSpace <$>
+      ImpGen.lookupMemory (ImpGen.memLocationName (ImpGen.entryArrayLocation entry))
+    _ -> return False
+arrayInLocalMemory Constant{} = return False
